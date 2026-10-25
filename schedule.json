@@ -1,0 +1,25 @@
+{
+  "auto_advance": false,
+  "activities": [
+    {
+      "name": "Brush",
+      "minutes": 5.0
+    },
+    {
+      "name": "Poop",
+      "minutes": 15.0
+    },
+    {
+      "name": "Shower",
+      "minutes": 15.0
+    },
+    {
+      "name": "Dress",
+      "minutes": 10.0
+    },
+    {
+      "name": "Exercise",
+      "minutes": 10.0
+    }
+  ]
+}

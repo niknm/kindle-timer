@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timer</title>
+<!-- Runs entirely in the Paperwhite 1's old WebKit browser: ES5 only, no flexbox.
+     Schedule comes from a Google Sheet (columns: Activity | Minutes, header row first).
+     Progress is kept in localStorage so it survives the Kindle sleeping or reloading. -->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; color: #000; font-family: Georgia, serif; }
+  #wrap { padding: 20px; text-align: center; }
+  #pos { font-size: 26px; }
+  #name { font-size: 60px; font-weight: bold; margin: 20px 0 0; line-height: 1.1; }
+  #dial { display: block; margin: 16px auto 0; }
+  #status { font-size: 36px; height: 46px; margin-top: 16px; }
+  #upnext { font-size: 30px; margin-top: 14px; height: 40px; }
+  table { width: 100%; margin-top: 30px; border-collapse: separate; border-spacing: 14px; }
+  td { border: 4px solid #000; font-size: 40px; font-weight: bold; padding: 40px 0; text-align: center; }
+  #next { background: #000; color: #fff; width: 50%; }
+  #err, #source { font-size: 20px; height: 28px; }
+  #flash { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 3000px; background: #000; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="err"></div>
+  <div id="pos"></div>
+  <div id="name">Loading…</div>
+  <canvas id="dial" width="440" height="440"></canvas>
+  <div id="status"></div>
+  <div id="upnext"></div>
+  <table><tr>
+    <td id="prev" onclick="act('prev')">Back</td>
+    <td id="toggle" onclick="act('toggle')">Start</td>
+    <td id="next" onclick="act('next')">Next</td>
+  </tr></table>
+  <div id="source"></div>
+</div>
+<div id="flash"></div>
+<script>
+// ---- Settings (URL params override: ?sheet=ID&auto=1) ----
+var SHEET_ID = '1rYL8CF7JHB7_EEMlPCos8tO0oYVgEUmLFAVB_1G3LBg';      // Google Sheet ID, shared as "Anyone with the link can view"
+var AUTO_ADVANCE = false;
+var POLL_MS = 30000;    // how often the dial redraws
+var FLASHES = 6;        // black/white alternations when time is up
+var FLASH_MS = 700;
+
+var params = {};
+location.search.replace(/[?&]([^=&]+)=([^&]*)/g, function (m, k, v) { params[k] = decodeURIComponent(v); });
+if (params.sheet) SHEET_ID = params.sheet;
+if (params.auto) AUTO_ADVANCE = params.auto === '1';
+
+var sched = null;
+var st = null;          // {idx, endsAt (ms epoch) or null, left (ms, when paused), alerted}
+var loopTimer = null;
+
+function now() { return new Date().getTime(); }
+
+function store(key, val) {
+  try {
+    if (val === undefined) return JSON.parse(localStorage.getItem(key));
+    localStorage.setItem(key, JSON.stringify(val));
+  } catch (e) { return null; }
+}
+
+// ---- Schedule loading: Google Sheet (JSONP, no CORS needed) -> schedule.json -> saved copy ----
+function loadSheet(cb) {
+  if (!SHEET_ID) { cb(null); return; }
+  var finished = false;
+  function finish(v) { if (!finished) { finished = true; cb(v); } }
+  window.onSheet = function (resp) {
+    try {
+      var rows = resp.table.rows, out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var c = rows[i].c;
+        if (!c || !c[0] || !c[1] || c[0].v == null) continue;
+        var mins = parseFloat(c[1].v);
+        if (String(c[0].v).replace(/\s/g, '') && mins > 0) out.push({ name: String(c[0].v), minutes: mins });
+      }
+      finish(out.length ? out : null);
+    } catch (e) { finish(null); }
+  };
+  var s = document.createElement('script');
+  s.src = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID + '/gviz/tq?tqx=responseHandler:onSheet&headers=1&t=' + now();
+  s.onerror = function () { finish(null); };
+  document.getElementsByTagName('head')[0].appendChild(s);
+  setTimeout(function () { finish(null); }, 15000);
+}
+
+function loadJson(cb) {
+  var x = new XMLHttpRequest();
+  x.open('GET', 'schedule.json?t=' + now(), true);
+  x.onreadystatechange = function () {
+    if (x.readyState !== 4) return;
+    try { cb(x.status === 200 ? JSON.parse(x.responseText).activities : null); } catch (e) { cb(null); }
+  };
+  x.send(null);
+}
+
+function loadSchedule(cb) {
+  setText('source', 'Loading schedule…');
+  loadSheet(function (acts) {
+    if (acts) return use(acts, 'Google Sheet');
+    loadJson(function (acts) {
+      if (acts && acts.length) return use(acts, SHEET_ID ? 'schedule.json (sheet unreachable)' : 'schedule.json');
+      acts = store('schedule');
+      if (acts) return use(acts, 'saved copy (offline)');
+      setText('err', 'Could not load a schedule');
+    });
+  });
+  function use(acts, source) {
+    sched = acts;
+    store('schedule', acts);
+    setText('source', 'Schedule: ' + esc(source));
+    cb();
+  }
+}
+
+// ---- Timer state ----
+function dur(i) { return sched[i].minutes * 60000; }
+function done() { return st.idx >= sched.length; }
+function running() { return st.endsAt !== null; }
+function remaining() { return running() ? st.endsAt - now() : st.left; }
+
+function goto(i, run) {
+  st.idx = Math.max(0, Math.min(i, sched.length));
+  st.alerted = false;
+  st.endsAt = null;
+  st.left = done() ? 0 : dur(st.idx);
+  if (run && !done()) start();
+}
+
+function start() { st.endsAt = now() + st.left; st.left = null; }
+
+// Handle any activity that has run out (possibly several, if the Kindle slept with auto-advance on).
+function checkEnd() {
+  var fired = false;
+  while (running() && !done() && !st.alerted && remaining() <= 0) {
+    fired = true;
+    if (AUTO_ADVANCE) {
+      var end = st.endsAt;
+      st.idx++;
+      if (done()) { st.endsAt = null; st.left = 0; } else { st.endsAt = end + dur(st.idx); }
+    } else {
+      st.alerted = true;
+    }
+  }
+  if (fired) { store('state', st); flash(); }
+}
+
+function act(name) {
+  if (!sched) return;
+  if (name === 'next') goto(st.idx + 1, true);
+  else if (name === 'prev') goto(st.idx - 1, true);
+  else if (done()) { loadSchedule(function () { goto(0, true); store('state', st); loop(); }); return; }
+  else if (running()) { st.left = remaining(); st.endsAt = null; }
+  else start();
+  store('state', st);
+  loop();
+}
+
+// ---- Display ----
+function setText(id, text) {
+  var el = document.getElementById(id);
+  if (el.innerHTML !== text) el.innerHTML = text;   // avoid needless e-ink refreshes
+}
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function flash() {
+  var el = document.getElementById('flash'), n = 0;
+  var t = setInterval(function () {
+    el.style.display = n % 2 ? 'none' : 'block';
+    if (++n >= FLASHES * 2) { clearInterval(t); el.style.display = 'none'; }
+  }, FLASH_MS);
+}
+
+// Black wedge = time left, shrinking clockwise from 12 o'clock.
+function drawDial(frac, label, small) {
+  var c = document.getElementById('dial'), g = c.getContext('2d');
+  var cx = c.width / 2, cy = c.height / 2, r = cx - 6;
+  g.clearRect(0, 0, c.width, c.height);
+  g.fillStyle = '#000';
+  g.strokeStyle = '#000';
+  if (frac > 0) {
+    g.beginPath();
+    g.moveTo(cx, cy);
+    g.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + frac * 2 * Math.PI, false);
+    g.closePath();
+    g.fill();
+  }
+  g.lineWidth = 6;
+  g.beginPath();
+  g.arc(cx, cy, r, 0, 2 * Math.PI, false);
+  g.stroke();
+  g.fillStyle = '#fff';
+  g.beginPath();
+  g.arc(cx, cy, r * 0.42, 0, 2 * Math.PI, false);
+  g.fill();
+  g.lineWidth = 4;
+  g.stroke();
+  g.fillStyle = '#000';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.font = 'bold ' + (small ? 34 : 52) + 'px Georgia, serif';
+  g.fillText(label, cx, cy);
+}
+
+function render() {
+  if (done()) {
+    setText('pos', '');
+    setText('name', 'All done');
+    drawDial(0, 'Done', false);
+    setText('status', '');
+    setText('upnext', '');
+    setText('toggle', 'Restart');
+    return;
+  }
+  var rem = remaining(), d = dur(st.idx);
+  setText('pos', (st.idx + 1) + ' / ' + sched.length);
+  setText('name', esc(sched[st.idx].name));
+  if (rem <= 0) {
+    drawDial(0, 'TIME UP', true);
+    setText('status', rem < -59000 ? '+' + Math.floor(-rem / 60000) + ' min over' : 'Tap Next');
+  } else {
+    drawDial(Math.min(1, rem / d), rem >= 60000 ? Math.ceil(rem / 60000) + ' min' : '<1 min', false);
+    setText('status', running() ? '' : 'Paused');
+  }
+  setText('upnext', st.idx + 1 < sched.length ? 'Next: ' + esc(sched[st.idx + 1].name) : 'Last activity');
+  setText('toggle', running() ? 'Pause' : (rem === d ? 'Start' : 'Resume'));
+}
+
+// Redraw every POLL_MS, but wake exactly when the current activity ends.
+function loop() {
+  if (loopTimer) clearTimeout(loopTimer);
+  checkEnd();
+  render();
+  var wait = POLL_MS, rem = remaining();
+  if (running() && !done() && rem > 0 && rem < wait) wait = rem + 300;
+  loopTimer = setTimeout(loop, wait);
+}
+
+loadSchedule(function () {
+  st = store('state');
+  if (!st || typeof st.idx !== 'number') { st = {}; goto(0, false); }
+  if (st.idx > sched.length) goto(sched.length, false);
+  loop();
+});
+</script>
+</body>
+</html>
